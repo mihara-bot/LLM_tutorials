@@ -10,6 +10,7 @@
 6. [第六章：INT8/INT4量化——推理时的极致压缩](#第六章)
 7. [第七章：Mixed Precision Training——工程实践](#第七章)
 8. [第八章：完整实例——手搓一个混合精度训练循环](#第八章)
+9. [第九章：LLM Pre-training/SFT的显存占用计算](#第九章)
 
 ---
 
@@ -692,6 +693,569 @@ NVIDIA A100 Tensor Core:
 
 ---
 
+## 第九章：LLM Pre-training/SFT的显存占用计算 {#第九章}
+
+前面我们一直在讲"数值能不能算对"。这一章回答另一个同样现实的问题：
+
+**这份训练任务，到底能不能塞进一张GPU里？**
+
+很多人一提显存，只会说"这是个7B模型，所以大概要14GB/28GB/80GB"。这只说对了一小部分。训练时真正占显存的，至少有四类东西：
+
+- **模型参数（weights）**
+- **梯度（gradients）**
+- **优化器状态（optimizer states）**
+- **激活值（activations）**
+
+而且对 Pre-training、全量 SFT、LoRA SFT、QLoRA SFT，这四块的比例完全不同。
+
+这一章的目标不是给你一个死记硬背的数字，而是给你一套**可复用的估算公式**。你拿到模型配置后，应该能自己在纸上算出：
+
+- 单卡大概要多少显存
+- 为什么会OOM
+- 降 `micro_batch_size`、降 `seq_len`、开 checkpointing、换 LoRA，到底哪一步最有效
+
+如果你想直接把这些公式跑成命令行工具，可以配合使用脚本 [vram_estimator.py](/Users/xinlin.zhuang/Codes/LLM_tutorials/float_tutorials/vram_estimator.py)。
+
+### 9.1 先把训练显存拆成四块
+
+一个训练任务的峰值显存，可以先写成：
+
+```text
+总显存 ≈ 模型状态 + 激活显存 + 临时workspace/通信buffer + 碎片/安全余量
+```
+
+其中：
+
+- **模型状态（model states）** = 参数 + 梯度 + 优化器状态
+- **激活显存（activations）** = forward过程中为了backward而保存的中间结果
+- **workspace / communication buffer** = CUDA kernel临时缓冲、all-gather/reduce-scatter buffer、FlashAttention工作区等
+- **安全余量** = PyTorch缓存分配器碎片、算子峰值抖动，工程上通常再留 10% 到 20%
+
+一个非常重要的工程事实：
+
+**决定峰值显存的往往不是 `global_batch_size`，而是 `micro_batch_size`。**
+
+因为梯度累加只是把多个 micro-batch 的梯度在时间上串起来，单次 forward/backward 的峰值显存主要还是由：
+
+```text
+micro_batch_size、seq_len、hidden_size、num_layers、precision
+```
+
+决定。
+
+另一个常见误区是把**训练激活**和**推理KV cache**混为一谈。这里我们讲的是训练显存，所以：
+
+- **训练时重点看 activations**
+- **推理时重点看 KV cache**
+
+它们不是一回事。
+
+### 9.2 第一步：先算总参数量 P_all
+
+如果你已经知道模型是"7B / 13B / 70B"，那可以直接把这个数字当作总参数量 `P_all`。
+
+但如果你手里拿到的是配置文件，那么也可以从结构手算出来。对一个 Llama-like 模型，定义：
+
+```text
+H = hidden_size
+I = intermediate_size
+L = num_hidden_layers
+V = vocab_size
+A = num_attention_heads
+K = num_key_value_heads
+H_kv = H × K / A
+```
+
+其中 `H_kv` 是 K/V 投影的总维度。例如 GQA 里 `num_key_value_heads < num_attention_heads`，所以 K/V 权重矩阵会比 Q/O 更小。
+
+对每一层 Transformer block，可以近似写成：
+
+```text
+Attention参数 ≈ H×H   (q_proj)
+             + H×H_kv (k_proj)
+             + H×H_kv (v_proj)
+             + H×H   (o_proj)
+             = 2H² + 2H×H_kv
+
+MLP参数（SwiGLU）≈ H×I + H×I + I×H = 3HI
+
+Norm参数 ≈ 2H
+```
+
+所以一层的总参数近似是：
+
+```text
+P_layer ≈ 2H² + 2H×H_kv + 3HI + 2H
+```
+
+整模型再加上 embedding 和 lm_head：
+
+```text
+P_all ≈ L×P_layer + V×H + [V×H if tie_word_embeddings=false else 0] + H
+```
+
+最后那个 `+H` 对应最终的 RMSNorm，通常很小，可以忽略不计。
+
+#### 手算Llama-480M
+
+设一个Llama-380M的配置如下：
+
+```text
+H = 1024
+I = 3584
+L = 16
+V = 128256
+A = 8
+K = 2
+H_kv = 1024 × 2 / 8 = 256
+tie_word_embeddings = false
+```
+
+先算每层：
+
+```text
+Attention = 2×1024² + 2×1024×256
+          = 2,621,440
+
+MLP       = 3×1024×3584
+          = 11,010,048
+
+Norm      = 2×1024
+          = 2,048
+
+P_layer   = 13,633,536
+```
+
+再算全模型：
+
+```text
+Transformer blocks = 16 × 13,633,536 = 218,136,576
+Embedding          = 128,256 × 1024  = 131,334,144
+LM head            = 128,256 × 1024  = 131,334,144
+Final norm         = 1,024
+
+P_all = 218,136,576 + 131,334,144 + 131,334,144 + 1,024
+      = 480,805,888 ≈ 480M
+```
+
+这和配置名里的 `480m` 是对得上的。
+
+### 9.3 第二步：区分总参数 P_all 和可训练参数 P_train
+
+这一点决定了你是在算 **Pre-training / 全量SFT**，还是在算 **LoRA/QLoRA**。
+
+定义两个量：
+
+- `P_all`：模型总参数量
+- `P_train`：真正需要更新的参数量
+
+于是：
+
+- **Pre-training**：`P_train = P_all`
+- **全量 SFT**：`P_train = P_all`
+- **LoRA SFT**：`P_train = P_lora << P_all`
+- **QLoRA SFT**：`P_train = P_lora << P_all`，但底座参数还是要加载，只是不训练
+
+LoRA 的 trainable params 怎么算？如果对一个线性层 `W ∈ R^(d_out × d_in)` 注入秩为 `r` 的 LoRA，那么新增参数量是：
+
+```text
+P_lora_for_W = r×d_in + r×d_out = r(d_in + d_out)
+```
+
+比如你给某层的 `q_proj`（`H × H`）做 rank-8 的 LoRA，那么新增参数量就是：
+
+```text
+8(H + H) = 16H
+```
+
+把所有被插 LoRA 的线性层加起来，就是总的 `P_lora`。
+
+### 9.4 第三步：算模型状态显存
+
+模型状态显存是最容易写成公式的一部分：
+
+```text
+M_model_states
+= 参数显存 + 梯度显存 + 优化器显存
+= P_frozen × b_frozen + P_train × (b_weight + b_grad + b_opt [+ b_master])
+```
+
+这里的 `b_*` 单位都是"字节/参数"。
+
+常见训练配置下，每个**可训练参数**大概对应下面这些字节数：
+
+| 训练配置 | 每个trainable param的显存 |
+|---|---|
+| FP32 + AdamW | 4（权重） + 4（梯度） + 8（m,v） = **16 bytes** |
+| BF16/FP16 + AdamW（无FP32 master） | 2（权重） + 2（梯度） + 8（m,v） = **12 bytes** |
+| BF16/FP16 + AdamW（有FP32 master） | 2（权重） + 2（梯度） + 8（m,v） + 4（master） = **16 bytes** |
+
+常见**冻结参数**的显存：
+
+| 参数状态 | 每个frozen param的显存 |
+|---|---|
+| Frozen BF16/FP16 | **2 bytes** |
+| Frozen FP32 | **4 bytes** |
+| Frozen 4-bit量化权重（QLoRA底座） | 理想值 **0.5 bytes**，加上scale/metadata后工程上常按 **0.55 到 0.6 bytes** 估算 |
+
+如果你用的不是 AdamW，而是 SGD / Momentum / Muon 这类优化器，那么只需要把上式里的 `b_opt` 换成对应的优化器状态字节数即可。AdamW 之所以常被拿来做容量规划，是因为它最常见，也通常比 momentum-only 优化器更占显存。
+
+所以：
+
+- 对 **Pre-training / 全量 SFT**，默认就是 `P_train = P_all`
+- 对 **LoRA / QLoRA**，底座是 `P_frozen = P_all`，只有 LoRA adapter 是 `P_train`
+
+#### 继续用 480M 模型举例
+
+如果我们假设使用 **BF16 + AdamW，无FP32 master weight**，那么：
+
+```text
+M_model_states = 480,805,888 × 12 bytes
+               = 5,769,670,656 bytes
+               ≈ 5.37 GiB
+```
+
+如果你的框架额外保留 FP32 master weight，那就要改成：
+
+```text
+480,805,888 × 16 bytes ≈ 7.17 GiB
+```
+
+注意这里我用了 **GiB**：
+
+```text
+1 GiB = 1024^3 bytes
+1 GB  = 1000^3 bytes
+```
+
+显卡宣传页经常写 GB，但 `nvidia-smi` / PyTorch 更接近 GiB 语境，所以手算时最好统一。
+
+### 9.5 第四步：算激活显存
+
+训练时第二大头通常是 activations，而且它比参数显存更"容易突然爆炸"。
+
+粗略地说，激活显存和下面这些量成正比：
+
+```text
+层数 L
+micro batch B
+序列长度 T
+隐藏维度 H
+激活精度字节数 b
+```
+
+一个非常常用的工程近似是：
+
+```text
+M_act ≈ c × L × B × T × H × b
+```
+
+其中：
+
+- `B` 是 **micro_batch_size**，不是 global batch
+- `T` 是单次 forward 的**总序列长度**
+- `b` 对 BF16/FP16 通常是 2，对 FP32 是 4
+- `c` 是一个和实现细节有关的常数
+
+经验上：
+
+- **开了 activation checkpointing + FlashAttention**：`c` 常常在 **10 到 12** 左右
+- **没开 checkpointing**：`c` 可能到 **20 到 30**，甚至更高
+
+为什么 `T` 这么敏感？因为注意力如果显式保存 attention score / probability，还会额外出现一个平方项：
+
+```text
+M_attn_scores ≈ L × B × A × T² × b
+```
+
+这就是为什么：
+
+- `seq_len` 从 2048 翻到 4096，不是只涨一倍那么简单
+- FlashAttention 之类的优化非常值钱
+
+#### 继续用 480M 配置举例
+
+从 [llama3_1_480m_pe.yaml](/Users/xinlin.zhuang/Codes/pretrain_LLM_pipeline/configs/exp/muon/llama3_1_480m_pe.yaml) 和 [tokenize_llama3_1.yaml](/Users/xinlin.zhuang/Codes/pretrain_LLM_pipeline/configs/data/tokenize_llama3_1.yaml) 可以读到：
+
+```text
+micro_batch_size B = 8
+seq_len T = 2048
+L = 16
+H = 1024
+b = 2 (bf16)
+```
+
+如果我们取一个比较常见的经验值 `c = 12`：
+
+```text
+M_act ≈ 12 × 16 × 8 × 2048 × 1024 × 2 bytes
+      ≈ 6.00 GiB
+```
+
+如果没有 FlashAttention，attention score 的平方项单独就大约是：
+
+```text
+M_attn_scores ≈ 16 × 8 × 8 × 2048² × 2 bytes
+              ≈ 8.00 GiB
+```
+
+这两个数字放在一起，你就能立刻理解为什么长上下文训练这么容易OOM。
+
+### 9.6 Pre-training、全量SFT、LoRA、QLoRA到底分别怎么算
+
+现在可以把几种常见场景统一起来了。
+
+#### 场景A：Pre-training
+
+Pre-training 的特点是：
+
+- 全参数训练，所以 `P_train = P_all`
+- 通常有 packing，padding 浪费相对少
+- global batch 很大，但真正影响单卡峰值的是 `micro_batch_size`
+
+因此一个非常实用的估算公式是：
+
+```text
+M_pretrain ≈ P_all × bytes_per_trainable_param
+           + c × L × B × T × H × b
+           + overhead
+```
+
+其中：
+
+- 对 BF16 + AdamW（无master）可先用 `bytes_per_trainable_param = 12`
+- `overhead` 工程上先按前两项之和的 10% 到 20% 预留
+
+#### 场景B：全量 SFT
+
+全量 SFT 在显存公式上和 Pre-training **几乎完全一样**：
+
+```text
+M_full_sft ≈ P_all × bytes_per_trainable_param
+           + c × L × B × T × H × b
+           + overhead
+```
+
+差别主要不是公式，而是数据形态：
+
+- SFT 样本长度波动更大，padding 可能更严重
+- 经常是长 prompt + 短 answer，导致有效监督token比例不高
+- 即使只对 answer 区域算 loss，**整段 prompt + answer 还是都要过模型**，激活显存并不会只按 answer 长度算
+
+所以很多人看到"我只训练回答部分"就以为显存会小很多，这通常是错觉。
+
+#### 场景C：LoRA SFT
+
+LoRA 的关键变化是：
+
+- 底座参数冻结，只占权重显存
+- 只有 adapter 参数需要梯度和优化器状态
+
+所以：
+
+```text
+M_lora ≈ P_all × b_frozen
+       + P_lora × bytes_per_trainable_param
+       + c × L × B × T × H × b
+       + overhead
+```
+
+最重要的结论是：
+
+**LoRA 大幅降低的是模型状态显存，但 activation 显存几乎不变。**
+
+也就是说：
+
+- 7B 全量 SFT 跑不动
+- 7B LoRA 能跑
+- 但如果你把 `seq_len` 从 2K 拉到 8K，LoRA 一样可能OOM
+
+#### 场景D：QLoRA SFT
+
+QLoRA 进一步把**冻结底座**从 BF16 压到 4-bit：
+
+```text
+M_qlora ≈ P_all × b_4bit_frozen
+        + P_lora × bytes_per_trainable_param
+        + c × L × B × T × H × b
+        + dequant_workspace
+        + overhead
+```
+
+其中：
+
+- `b_4bit_frozen` 可以先按 **0.55 到 0.6 bytes/param** 估
+- `dequant_workspace` 是量化矩阵乘法过程中的额外临时显存，通常没有 activations 大，但不能完全忽略
+
+QLoRA 节省的仍然主要是**模型状态显存**，不是激活显存。
+
+### 9.7 两个最典型的完整算例
+
+#### 算例1：你仓库里的 480M Pre-training 配置
+
+我们把前面的结果合起来：
+
+- 模型：约 `480.8M` 参数
+- 精度：BF16
+- 假设优化器按 AdamW 的 `12 bytes/trainable param` 估
+- `micro_batch_size = 8`
+- `seq_len = 2048`
+- 激活经验系数 `c = 12`
+
+先算模型状态：
+
+```text
+M_model_states ≈ 480.8M × 12 bytes ≈ 5.37 GiB
+```
+
+再算激活：
+
+```text
+M_act ≈ 12 × 16 × 8 × 2048 × 1024 × 2 bytes ≈ 6.00 GiB
+```
+
+两者相加：
+
+```text
+5.37 + 6.00 = 11.37 GiB
+```
+
+再给 15% 安全余量：
+
+```text
+M_total ≈ 11.37 × 1.15 ≈ 13.1 GiB
+```
+
+所以这个配置在一张 **24GB** 卡上，从纯显存预算角度看是比较有希望跑起来的。
+
+如果你：
+
+- 不开 activation checkpointing
+- 不用 FlashAttention
+- 框架还保留 FP32 master weight
+
+那峰值显存会明显再往上走。
+
+#### 算例2：7B 模型做全量SFT vs LoRA/QLoRA
+
+先看**全量 SFT**。如果是 7B 模型，假设 BF16 + AdamW（无master）：
+
+```text
+M_model_states ≈ 7B × 12 bytes = 84 GB ≈ 78.2 GiB
+```
+
+注意这还**没算 activations**。
+
+所以：
+
+- 单张 24GB 卡：几乎不可能
+- 单张 48GB 卡：通常也不够
+- 要么多卡分片（FSDP / ZeRO-3），要么改成 LoRA/QLoRA
+
+再看 **LoRA SFT**。如果 7B 底座冻结成 BF16：
+
+```text
+Frozen base ≈ 7B × 2 bytes = 14 GB ≈ 13.0 GiB
+```
+
+假设 LoRA 一共只有 `8M` 个可训练参数，按 `12 bytes/trainable param` 算：
+
+```text
+LoRA trainable states ≈ 8M × 12 bytes ≈ 0.09 GiB
+```
+
+这时总显存的主力就变成：
+
+- 冻结底座权重
+- activations
+
+如果进一步做 **QLoRA**，把底座压成 4-bit，按 `0.57 bytes/param` 估：
+
+```text
+Frozen base ≈ 7B × 0.57 bytes ≈ 3.7 GiB
+```
+
+这就是为什么：
+
+- 全量SFT一个7B模型，单卡24GB通常不现实
+- LoRA在24GB上常常可行
+- QLoRA会更宽松，但长上下文时 activations 仍然可能成为瓶颈
+
+### 9.8 分布式训练会怎样改这个公式
+
+前面的公式是"单卡视角"。分布式训练的本质，是把某些状态切碎到多张卡上。
+
+#### Data Parallel（DP / DDP）
+
+- 每张卡都保留完整模型、完整梯度、完整优化器状态
+- 所以**单卡模型状态显存几乎不降**
+- 只是总吞吐变高了
+
+#### ZeRO-1
+
+- 优化器状态分片
+- 单卡大致变成：参数 + 梯度 + `优化器状态 / N`
+
+#### ZeRO-2
+
+- 优化器状态和梯度都分片
+- 单卡大致变成：参数 + `梯度 / N` + `优化器状态 / N`
+
+#### ZeRO-3 / FSDP Full Shard
+
+- 参数、梯度、优化器状态都分片
+- 单卡大致接近：
+
+```text
+(参数 + 梯度 + 优化器状态) / N + activations + 通信buffer
+```
+
+注意这里说的是**平均占用**。真实峰值还会因为 all-gather / reduce-scatter 出现局部抬高，所以不能天真地直接除以 `N` 就完事。
+
+### 9.9 一个最好用的实战口诀
+
+真正做容量规划时，可以按下面四步走：
+
+1. **先算 `P_all` 和 `P_train`**
+2. **根据精度和优化器，选每个trainable param多少bytes**
+3. **用 `micro_batch_size` 和 `seq_len` 估 activations**
+4. **最后乘 1.1 到 1.2，留安全余量**
+
+可以把它压缩成三条速记公式：
+
+```text
+Pre-training / 全量SFT:
+VRAM ≈ P_all × bytes_trainable + cLBTHb + overhead
+
+LoRA SFT:
+VRAM ≈ P_all × bytes_frozen + P_lora × bytes_trainable + cLBTHb + overhead
+
+QLoRA SFT:
+VRAM ≈ P_all × bytes_4bit_frozen + P_lora × bytes_trainable + cLBTHb + overhead
+```
+
+其中 `cLBTHb` 只是：
+
+```text
+c × num_layers × micro_batch_size × seq_len × hidden_size × activation_bytes
+```
+
+最后给一个非常实用的判断：
+
+- **想省模型状态显存**：优先 LoRA / QLoRA / FSDP / ZeRO
+- **想省激活显存**：优先降 `micro_batch_size`、降 `seq_len`、开 activation checkpointing、开 FlashAttention
+- **想提升吞吐但不增加单卡峰值显存**：优先用 gradient accumulation 拉 global batch
+
+到这里，你应该已经能自己估算：
+
+- 一个 Pre-training 配置能不能在 8×24GB 上跑
+- 一个 7B 全量SFT为什么上不去
+- 一个 LoRA/QLoRA 任务为什么明明"只训练几百万参数"，还是会因为长上下文而OOM
+
+这就是 LLM 显存规划最核心的思维方式：**先分清是谁在占显存，再看它是按参数量增长，还是按序列长度和batch增长。**
+
+---
+
 ## 附录：从论文定理到代码的速查表
 
 | 论文概念 | 对应公式 | LLM训练中的体现 |
@@ -704,3 +1268,4 @@ NVIDIA A100 Tensor Core:
 | NaN传播 (Sec 2.2.1) | 任何含NaN的运算结果都是NaN | 训练"爆炸"的传播机制 |
 | Overflow (Sec 2.2.2) | 超出范围→Inf | FP16训练中的梯度爆炸 |
 | 论文eq.(31) 求和误差 | 误差 ≈ nε·Σ|x_j| | 大batch梯度累加需要高精度 |
+| 显存预算 | 参数/梯度/优化器/激活分解 | 训练前判断单卡/多卡是否会OOM |
