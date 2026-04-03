@@ -930,6 +930,26 @@ M_model_states = 480,805,888 × 12 bytes
 
 显卡宣传页经常写 GB，但 `nvidia-smi` / PyTorch 更接近 GiB 语境，所以手算时最好统一。
 
+一个BF16 + FP32 master weight + AdamW的标准流程如下:
+
+
+```text
+维护两份权重：
+  - w_fp32 (FP32 master weight, 存在优化器里, 4 bytes)
+  - w_bf16 (BF16 working copy, 用于前向/反向, 2 bytes)
+
+每个训练步骤:
+  1. Forward:  用 w_bf16 做前向传播（快，省显存）
+  2. Backward: 用 w_bf16 算梯度 g_bf16（快）
+  3. 优化器更新（全部在 FP32 下完成）:
+       g_fp32 = cast(g_bf16)           // 梯度提升精度
+       m = β₁ * m + (1-β₁) * g_fp32   // FP32 EMA
+       v = β₂ * v + (1-β₂) * g_fp32²  // FP32 EMA
+       Δw = m / (√v + ε)
+       w_fp32 = w_fp32 - lr * (Δw + λ * w_fp32)  // ← 关键：在 FP32 下做减法
+  4. Cast: w_bf16 = BF16(w_fp32)       // 截断回 BF16 用于下一步
+```
+
 ### 9.5 第四步：算激活显存
 
 训练时第二大头通常是 activations，而且它比参数显存更"容易突然爆炸"。
